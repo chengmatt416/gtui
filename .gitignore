@@ -1,0 +1,18 @@
+# Added automatically by GTUI
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+dist/
+build/
+target/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.env
+*.log

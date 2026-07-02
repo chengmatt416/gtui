@@ -204,6 +204,10 @@ def print_header(config, git_info):
 
 def run_menu(options, config, title=None):
     selected_idx = 0
+    # Make sure starting index is not a header
+    while selected_idx < len(options) and options[selected_idx].get("is_header"):
+        selected_idx += 1
+        
     fd = sys.stdin.fileno()
     
     while True:
@@ -214,7 +218,9 @@ def run_menu(options, config, title=None):
             print(f"  {BOLD}{YELLOW}::: {title} :::{RESET}\n")
             
         for idx, option in enumerate(options):
-            if idx == selected_idx:
+            if option.get("is_header"):
+                print(f"  {BOLD}{MAGENTA}─── {option['name']} ───{RESET}")
+            elif idx == selected_idx:
                 print(f"  {CYAN}▶  {BOLD}{UNDERLINE}{option['name']}{RESET}")
             else:
                 print(f"     {GRAY}{option['name']}{RESET}")
@@ -231,9 +237,15 @@ def run_menu(options, config, title=None):
                 if ch2 == '[':
                     ch3 = sys.stdin.read(1)
                     if ch3 == 'A':    # Up
-                        selected_idx = (selected_idx - 1) % len(options)
+                        while True:
+                            selected_idx = (selected_idx - 1) % len(options)
+                            if not options[selected_idx].get("is_header"):
+                                break
                     elif ch3 == 'B':  # Down
-                        selected_idx = (selected_idx + 1) % len(options)
+                        while True:
+                            selected_idx = (selected_idx + 1) % len(options)
+                            if not options[selected_idx].get("is_header"):
+                                break
             elif ch.lower() == 'q':
                 return None
             elif ch in ['\r', '\n']:
@@ -270,6 +282,483 @@ def parse_git_remote(url):
             if len(path_parts) >= 2:
                 return path_parts[0], "/".join(path_parts[1:])
     return None, None
+def ensure_gitignore():
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        return
+
+    gitignore_path = ".gitignore"
+    common_ignores = [
+        "node_modules/",
+        "__pycache__/",
+        "*.pyc",
+        "*.pyo",
+        "*.pyd",
+        ".venv/",
+        "venv/",
+        "env/",
+        "dist/",
+        "build/",
+        "target/",
+        ".idea/",
+        ".vscode/",
+        ".DS_Store",
+        "Thumbs.db",
+        ".env",
+        "*.log"
+    ]
+    
+    existing_lines = []
+    if os.path.exists(gitignore_path):
+        try:
+            with open(gitignore_path, 'r', encoding='utf-8') as f:
+                existing_lines = [line.strip() for line in f.read().splitlines()]
+        except Exception:
+            pass
+
+    to_add = []
+    for pattern in common_ignores:
+        if pattern not in existing_lines:
+            to_add.append(pattern)
+            
+    if to_add:
+        try:
+            needs_leading_newline = False
+            if os.path.exists(gitignore_path) and os.path.getsize(gitignore_path) > 0:
+                with open(gitignore_path, 'rb') as f_bin:
+                    try:
+                        f_bin.seek(-1, 2)
+                        last_char = f_bin.read(1)
+                        if last_char != b'\n':
+                            needs_leading_newline = True
+                    except Exception:
+                        pass
+            
+            with open(gitignore_path, 'a', encoding='utf-8') as f:
+                if needs_leading_newline:
+                    f.write('\n')
+                f.write("# Added automatically by GTUI\n")
+                for pattern in to_add:
+                    f.write(f"{pattern}\n")
+            print(f"{GREEN}✔ 已自動將 {', '.join(to_add)} 加入 .gitignore{RESET}")
+        except Exception as e:
+            print(f"{RED}無法更新 .gitignore: {e}{RESET}")
+
+def https_to_ssh_url(url):
+    if url.startswith("git@") or "ssh://" in url:
+        return url
+        
+    parsed = urllib.parse.urlparse(url)
+    domain = parsed.netloc
+    
+    if "@" in domain:
+        domain = domain.split("@")[-1]
+        
+    port = None
+    if ":" in domain:
+        domain_parts = domain.split(":")
+        domain = domain_parts[0]
+        port = domain_parts[1]
+        
+    path = parsed.path.lstrip('/')
+    if not path.endswith(".git"):
+        path = path + ".git"
+        
+    if port:
+        return f"ssh://git@{domain}:{port}/{path}"
+    else:
+        return f"git@{domain}:{path}"
+
+def get_or_create_ssh_key(username):
+    ssh_dir = os.path.expanduser("~/.ssh")
+    os.makedirs(ssh_dir, exist_ok=True)
+    
+    possible_keys = ["id_ed25519.pub", "id_rsa.pub", "id_ecdsa.pub", "id_dsa.pub"]
+    for k in possible_keys:
+        path = os.path.join(ssh_dir, k)
+        if os.path.exists(path):
+            return path
+            
+    key_path = os.path.join(ssh_dir, "id_ed25519")
+    pub_key_path = key_path + ".pub"
+    print("正在生成新的 Ed25519 SSH 金鑰...")
+    rc_gen = subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-C", f"{username}@gtui"],
+        capture_output=True
+    ).returncode
+    if rc_gen == 0:
+        subprocess.run(["ssh-add", key_path], capture_output=True)
+        return pub_key_path
+    return None
+
+def check_and_handle_remote_updates(config):
+    print("正在檢查遠端是否有新 Commit...")
+    # 1. Fetch remote tracking branch info
+    res_fetch = subprocess.run(["git", "fetch"], capture_output=True)
+    if res_fetch.returncode != 0:
+        print(f"{YELLOW}⚠️ 無法更新遠端分支資訊 (git fetch 失敗)。{RESET}")
+        return True
+        
+    # 2. Check if HEAD is behind remote tracking branch
+    res_count = subprocess.run(["git", "rev-list", "--count", "HEAD..@{u}"], capture_output=True, text=True)
+    if res_count.returncode != 0:
+        return True
+        
+    try:
+        count = int(res_count.stdout.strip())
+    except ValueError:
+        count = 0
+        
+    if count == 0:
+        print(f"{GREEN}✔ 遠端無新 Commit，本地分支已是最新。{RESET}")
+        return True
+        
+    print(f"{YELLOW}偵測到遠端有新 commit (共 {count} 個)，正在嘗試自動 Pull 並 Rebase...{RESET}")
+    
+    # 3. Perform pull --rebase
+    rc_pull = run_command_live(["git", "pull", "--rebase"])
+    if rc_pull == 0:
+        print(f"{GREEN}✔ 自動 Pull & Rebase 成功！{RESET}")
+        return True
+        
+    # 4. If pull --rebase fails, check if we are in conflict (rebase in progress)
+    git_dir_res = subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True, text=True)
+    if git_dir_res.returncode == 0:
+        git_dir = git_dir_res.stdout.strip()
+        rebase_merge = os.path.join(git_dir, "rebase-merge")
+        rebase_apply = os.path.join(git_dir, "rebase-apply")
+        
+        if os.path.exists(rebase_merge) or os.path.exists(rebase_apply):
+            while True:
+                print(f"\n{RED}❌ Pull & Rebase 發生衝突！{RESET}")
+                print(f"{YELLOW}請手動解決衝突。{RESET}")
+                print(f"1. 已手動解決衝突，繼續 Rebase (git rebase --continue)")
+                print(f"2. 放棄 Rebase (git rebase --abort)")
+                print(f"3. 暫時返回主選單 (稍後手動處理)")
+                
+                choice = input("請選擇操作 (1-3): ").strip()
+                if choice == '1':
+                    rc_continue = run_command_live(["git", "rebase", "--continue"])
+                    if rc_continue == 0:
+                        print(f"{GREEN}✔ Rebase 成功完成！{RESET}")
+                        return True
+                    else:
+                        if os.path.exists(rebase_merge) or os.path.exists(rebase_apply):
+                            print(f"{YELLOW}仍然存在衝突或 Rebase 尚未完成。{RESET}")
+                            continue
+                        else:
+                            print(f"{RED}Rebase 失敗。{RESET}")
+                            return False
+                elif choice == '2':
+                    subprocess.run(["git", "rebase", "--abort"])
+                    print(f"{YELLOW}已取消 Rebase。{RESET}")
+                    return False
+                elif choice == '3':
+                    print(f"{YELLOW}已暫停處理。您可以在終端手動執行 git rebase --continue 解決衝突。{RESET}")
+                    return False
+                else:
+                    print("無效的選擇。")
+        else:
+            print(f"{RED}❌ Pull & Rebase 失敗。{RESET}")
+            return False
+    else:
+        print(f"{RED}❌ Pull & Rebase 失敗。{RESET}")
+        return False
+
+def run_push_with_fallback(config, cmd):
+    rc = run_command_live(cmd)
+    if rc == 0:
+        return 0
+        
+    git_info = get_git_info()
+    remote_url = git_info["remote_url"]
+    
+    if remote_url == "None" or not (remote_url.startswith("http://") or remote_url.startswith("https://")):
+        return rc
+        
+    print(f"\n{YELLOW}⚠️ 檢測到 HTTPS 傳輸失敗，是否要切換至 SSH 傳輸大檔案？{RESET}")
+    ans = input("是否切換至 SSH 傳輸？ (Y/n): ").strip().lower()
+    if ans == 'n':
+        return rc
+        
+    # Determine provider from the remote URL domain
+    parsed_url = urllib.parse.urlparse(remote_url)
+    domain = parsed_url.netloc
+    if "@" in domain:
+        domain = domain.split("@")[-1]
+    if ":" in domain:
+        domain = domain.split(":")[0]
+
+    if "gitlab" in domain.lower():
+        provider = "gitlab"
+    elif "github" in domain.lower():
+        provider = "github"
+    else:
+        provider = config.get("active_provider", "github")
+    
+    # 1. Ask for username
+    username = config.get(f"{provider}_user")
+    if not username:
+        username = input(f"請輸入您的 {provider.upper()} 使用者名稱 (username): ").strip()
+        if username:
+            config[f"{provider}_user"] = username
+            save_config(config)
+            
+    if not username:
+        print(f"{RED}錯誤: 未提供使用者名稱，無法繼續。{RESET}")
+        return rc
+        
+    # 2. Check SSH key status
+    ssh_ok = False
+    print(f"正在檢查與 git@{domain} 的 SSH 連線...")
+    try:
+        res = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", "-T", f"git@{domain}"],
+            capture_output=True, text=True
+        )
+        output = res.stdout + res.stderr
+        if "successfully authenticated" in output or "Welcome to GitLab" in output or "Welcome to" in output:
+            ssh_ok = True
+            print(f"{GREEN}✔ SSH 連線成功。{RESET}")
+    except Exception as e:
+        print(f"{RED}檢查 SSH 連線時發生錯誤: {e}{RESET}")
+        
+    if not ssh_ok:
+        print(f"{YELLOW}未檢測到有效的 SSH 金鑰設定或 SSH 測試失敗。{RESET}")
+        ans_key = input("是否自動為您生成並在雲端設定 SSH 金鑰？ (Y/n): ").strip().lower()
+        if ans_key != 'n':
+            token = config.get(f"{provider}_token")
+            if not token:
+                print(f"{RED}您尚未登入此平台，無法自動上傳 SSH 金鑰。請先在主選單執行登入。{RESET}")
+                return rc
+                
+            pub_key_path = get_or_create_ssh_key(username)
+            if pub_key_path:
+                try:
+                    with open(pub_key_path, 'r', encoding='utf-8') as f:
+                        pub_key_content = f.read().strip()
+                        
+                    print(f"正在上傳 SSH 金鑰至您的 {provider.upper()} 帳戶...")
+                    title = f"GTUI SSH Key ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                    
+                    if provider == "github":
+                        url = "https://api.github.com/user/keys"
+                        headers = {
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/vnd.github+json",
+                            "User-Agent": "gtui-app"
+                        }
+                        data = {"title": title, "key": pub_key_content}
+                        res, status = api_request(url, method="POST", headers=headers, data=data)
+                        if status == 201:
+                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitHub！{RESET}")
+                            ssh_ok = True
+                        else:
+                            print(f"{RED}❌ 無法上傳金鑰至 GitHub: {res.get('message')}{RESET}")
+                    elif provider == "gitlab":
+                        host = config.get("gitlab_host", "https://gitlab.com").rstrip('/')
+                        url = f"{host}/api/v4/user/keys"
+                        headers = {"Private-Token": token}
+                        data = {"title": title, "key": pub_key_content}
+                        res, status = api_request(url, method="POST", headers=headers, data=data)
+                        if status == 201:
+                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitLab！{RESET}")
+                            ssh_ok = True
+                        else:
+                            print(f"{RED}❌ 無法上傳金鑰至 GitLab: {res.get('message')}{RESET}")
+                except Exception as e:
+                    print(f"{RED}上傳金鑰時出錯: {e}{RESET}")
+            else:
+                return rc
+                
+    # 3. Convert remote URL to SSH
+    ssh_url = https_to_ssh_url(remote_url)
+    print(f"正在將遠端倉庫網址變更為 SSH: {CYAN}{ssh_url}{RESET}")
+    subprocess.run(["git", "remote", "set-url", "origin", ssh_url])
+    
+    # 4. Retry push
+    print("正在使用 SSH 重新嘗試推送...")
+    rc_retry = run_command_live(cmd)
+    if rc_retry == 0:
+        print(f"{GREEN}✔ 使用 SSH 重新推送成功！{RESET}")
+        return 0
+    else:
+        print(f"{RED}❌ 使用 SSH 重新推送仍失敗。將恢復為原遠端網址。{RESET}")
+        subprocess.run(["git", "remote", "set-url", "origin", remote_url])
+        return rc_retry
+
+def clone_flow(config):
+    print(f"{BOLD}{BLUE}=== 📥 一鍵 Clone 遠端倉庫 ==={RESET}")
+    print(f"將會 Clone 至當前目錄: {CYAN}{os.getcwd()}{RESET}")
+    url = input("請輸入要 Clone 的遠端 Repo 網址 (HTTPS/SSH): ").strip()
+    if not url:
+        print("取消操作。")
+        return
+        
+    print(f"正在 Clone 倉庫: {url} ...")
+    rc = run_command_live(["git", "clone", url])
+    if rc == 0:
+        print(f"\n{GREEN}✔ Clone 成功！{RESET}")
+        return
+        
+    # Check if URL was HTTPS and clone failed
+    if not (url.startswith("http://") or url.startswith("https://")):
+        print(f"\n{RED}❌ Clone 失敗，請確認網址或權限。{RESET}")
+        return
+        
+    print(f"\n{YELLOW}⚠️ 檢測到 HTTPS Clone 失敗，是否嘗試切換至 SSH Clone 傳輸？{RESET}")
+    ans = input("是否切換至 SSH 傳輸？ (Y/n): ").strip().lower()
+    if ans == 'n':
+        return
+        
+    # Parse domain
+    parsed_url = urllib.parse.urlparse(url)
+    domain = parsed_url.netloc
+    if "@" in domain:
+        domain = domain.split("@")[-1]
+    if ":" in domain:
+        domain = domain.split(":")[0]
+        
+    if "gitlab" in domain.lower():
+        provider = "gitlab"
+    elif "github" in domain.lower():
+        provider = "github"
+    else:
+        provider = config.get("active_provider", "github")
+        
+    # 1. Ask for username
+    username = config.get(f"{provider}_user")
+    if not username:
+        username = input(f"請輸入您的 {provider.upper()} 使用者名稱 (username): ").strip()
+        if username:
+            config[f"{provider}_user"] = username
+            save_config(config)
+            
+    if not username:
+        print(f"{RED}錯誤: 未提供使用者名稱，無法繼續。{RESET}")
+        return
+        
+    # 2. Check SSH key status
+    ssh_ok = False
+    print(f"正在檢查與 git@{domain} 的 SSH 連線...")
+    try:
+        res = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", "-T", f"git@{domain}"],
+            capture_output=True, text=True
+        )
+        output = res.stdout + res.stderr
+        if "successfully authenticated" in output or "Welcome to GitLab" in output or "Welcome to" in output:
+            ssh_ok = True
+            print(f"{GREEN}✔ SSH 連線成功。{RESET}")
+    except Exception as e:
+        print(f"{RED}檢查 SSH 連線時發生錯誤: {e}{RESET}")
+        
+    if not ssh_ok:
+        print(f"{YELLOW}未檢測到有效的 SSH 金鑰設定或 SSH 測試失敗。{RESET}")
+        ans_key = input("是否自動為您生成並在雲端設定 SSH 金鑰？ (Y/n): ").strip().lower()
+        if ans_key != 'n':
+            token = config.get(f"{provider}_token")
+            if not token:
+                print(f"{RED}您尚未登入此平台，無法自動上傳 SSH 金鑰。請先在主選單執行登入。{RESET}")
+                return
+                
+            pub_key_path = get_or_create_ssh_key(username)
+            if pub_key_path:
+                try:
+                    with open(pub_key_path, 'r', encoding='utf-8') as f:
+                        pub_key_content = f.read().strip()
+                        
+                    print(f"正在上傳 SSH 金鑰至您的 {provider.upper()} 帳戶...")
+                    title = f"GTUI SSH Key ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                    
+                    if provider == "github":
+                        headers = {
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/vnd.github+json",
+                            "User-Agent": "gtui-app"
+                        }
+                        data = {"title": title, "key": pub_key_content}
+                        res, status = api_request("https://api.github.com/user/keys", method="POST", headers=headers, data=data)
+                        if status == 201:
+                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitHub！{RESET}")
+                            ssh_ok = True
+                        else:
+                            print(f"{RED}❌ 無法上傳金鑰至 GitHub: {res.get('message')}{RESET}")
+                    elif provider == "gitlab":
+                        host = config.get("gitlab_host", "https://gitlab.com").rstrip('/')
+                        headers = {"Private-Token": token}
+                        data = {"title": title, "key": pub_key_content}
+                        res, status = api_request(f"{host}/api/v4/user/keys", method="POST", headers=headers, data=data)
+                        if status == 201:
+                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitLab！{RESET}")
+                            ssh_ok = True
+                        else:
+                            print(f"{RED}❌ 無法上傳金鑰至 GitLab: {res.get('message')}{RESET}")
+                except Exception as e:
+                    print(f"{RED}上傳金鑰時出錯: {e}{RESET}")
+            else:
+                return
+                
+    if ssh_ok:
+        # Convert url to SSH
+        ssh_url = https_to_ssh_url(url)
+        print(f"正在使用 SSH 網址重新嘗試 Clone: {CYAN}{ssh_url}{RESET}")
+        rc_retry = run_command_live(["git", "clone", ssh_url])
+        if rc_retry == 0:
+            print(f"\n{GREEN}✔ 使用 SSH Clone 成功！{RESET}")
+        else:
+            print(f"\n{RED}❌ 使用 SSH Clone 仍失敗。{RESET}")
+    else:
+        print(f"\n{RED}❌ 無法完成 SSH 設定，Clone 失敗。{RESET}")
+
+def quick_push_existing_flow(config):
+    print(f"{BOLD}{BLUE}=== 🚀 一鍵 Push 推送到此目錄的遠端倉庫 ==={RESET}")
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫，請先初始化。{RESET}")
+        return
+        
+    ensure_gitignore()
+    git_info = get_git_info()
+        
+    # Check if there are changes (staged or unstaged)
+    if git_info["staged"] > 0 or git_info["unstaged"] > 0:
+        print(f"偵測到未提交的變更 (暫存: {git_info['staged']}, 未暫存: {git_info['unstaged']})。")
+        ans = input("是否要將這些變更一併暫存、提交並 Push 推送？ (Y/n): ").strip().lower()
+        if ans != 'n':
+            run_command_live(["git", "add", "."])
+            commit_msg = input("請輸入 Commit 訊息 (直接 Enter 預設為時間戳): ").strip()
+            if not commit_msg:
+                commit_msg = f"Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            run_command_live(["git", "commit", "-m", commit_msg])
+            # Refresh status
+            git_info = get_git_info()
+            
+    # Check remote origin
+    if git_info["remote_url"] == "None":
+        print(f"{YELLOW}目前尚未設定遠端倉庫 (remote origin)。{RESET}")
+        url = input("請輸入遠端 Repo 網址 (HTTPS/SSH): ").strip()
+        if not url:
+            print("已取消操作。")
+            return
+        subprocess.run(["git", "remote", "add", "origin", url])
+        git_info = get_git_info()
+        
+    branch = git_info["branch"]
+    res = subprocess.run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], capture_output=True)
+    if res.returncode != 0:
+        print(f"{YELLOW}無上游分支，將設定上游並 Push...{RESET}")
+        rc = run_push_with_fallback(config, ["git", "push", "--set-upstream", "origin", branch])
+    else:
+        if not check_and_handle_remote_updates(config):
+            print(f"\n{RED}❌ 由於 Rebase 未完成或被取消，已中止 Push。{RESET}")
+            return
+        rc = run_push_with_fallback(config, ["git", "push"])
+        
+    if rc == 0:
+        print(f"\n{GREEN}✔ 一鍵 Push 成功！{RESET}")
+    else:
+        print(f"\n{RED}❌ Push 推送失敗。{RESET}")
 
 # --- Flows ---
 
@@ -342,6 +831,7 @@ def init_flow():
             
     rc = run_command_live(["git", "init"])
     if rc == 0:
+        ensure_gitignore()
         branch = input("請設定預設分支名稱 (預設: main): ").strip()
         if not branch:
             branch = "main"
@@ -466,6 +956,10 @@ def push_flow(config):
         print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫，請先初始化。{RESET}")
         return
         
+    ensure_gitignore()
+    # Re-evaluate git info since .gitignore might have been added/modified
+    git_info = get_git_info()
+        
     if git_info["staged"] == 0 and git_info["unstaged"] == 0:
         print(f"{YELLOW}目前沒有任何檔案變更。{RESET}")
         ans = input("是否要強制執行 git push 遠端同步？ (y/N): ").strip().lower()
@@ -500,9 +994,12 @@ def push_flow(config):
     if res.returncode != 0:
         # No upstream branch, set it
         print(f"{YELLOW}無上游分支，將設定上游並 Push...{RESET}")
-        rc = run_command_live(["git", "push", "--set-upstream", "origin", branch])
+        rc = run_push_with_fallback(config, ["git", "push", "--set-upstream", "origin", branch])
     else:
-        rc = run_command_live(["git", "push"])
+        if not check_and_handle_remote_updates(config):
+            print(f"\n{RED}❌ 由於 Rebase 未完成或被取消，已中止 Push。{RESET}")
+            return
+        rc = run_push_with_fallback(config, ["git", "push"])
         
     if rc == 0:
         print(f"\n{GREEN}✔ 一鍵 Push 成功！{RESET}")
@@ -664,6 +1161,8 @@ def quick_create_push_flow(config):
         print("初始化本地 Git 倉庫...")
         subprocess.run(["git", "init"], capture_output=True)
         
+    ensure_gitignore()
+    
     # Set default branch
     branch = "main"
     subprocess.run(["git", "branch", "-M", branch], capture_output=True)
@@ -679,10 +1178,11 @@ def quick_create_push_flow(config):
     subprocess.run(["git", "commit", "-m", "Initial commit via GTUI One-Click Setup"], capture_output=True)
     
     print("開始 Push 推送至雲端...")
-    rc = run_command_live(["git", "push", "-u", "origin", branch])
+    rc = run_push_with_fallback(config, ["git", "push", "-u", "origin", branch])
     if rc == 0:
         print(f"\n{GREEN}🎉 一鍵創建並推送完成！{RESET}")
-        print(f"您的倉庫網址: {CYAN}{clone_url}{RESET}")
+        git_info = get_git_info()
+        print(f"您的倉庫網址: {CYAN}{git_info['remote_url']}{RESET}")
     else:
         print(f"\n{RED}❌ 本地推送失敗，但雲端 Repo 已創立。請確認本地檔案及 Git 權限後手動 Push。{RESET}")
 
@@ -699,6 +1199,8 @@ def quick_specify_push_flow(config):
         print("初始化本地 Git 倉庫...")
         subprocess.run(["git", "init"], capture_output=True)
         
+    ensure_gitignore()
+        
     # Set default branch
     branch = "main"
     subprocess.run(["git", "branch", "-M", branch], capture_output=True)
@@ -714,7 +1216,7 @@ def quick_specify_push_flow(config):
     subprocess.run(["git", "commit", "-m", "Initial commit via GTUI One-Click Specify"], capture_output=True)
     
     print("開始 Push 推送至雲端...")
-    rc = run_command_live(["git", "push", "-u", "origin", branch])
+    rc = run_push_with_fallback(config, ["git", "push", "-u", "origin", branch])
     if rc == 0:
         print(f"\n{GREEN}🎉 一鍵指定並推送完成！{RESET}")
     else:
@@ -813,6 +1315,595 @@ def create_pr_flow(config):
         else:
             print(f"\n{RED}❌ 建立 MR 失敗: {res.get('message')}{RESET}")
 
+def add_collaborator_flow(config):
+    print(f"{BOLD}{BLUE}=== 👥 新增協作者 (Collaborator) ==={RESET}")
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫。{RESET}")
+        return
+    if git_info["remote_url"] == "None":
+        print(f"{RED}錯誤: 尚未綁定遠端倉庫，無法新增協作者。{RESET}")
+        return
+        
+    # Parse repo and owner
+    owner, repo = parse_git_remote(git_info["remote_url"])
+    if not owner or not repo:
+        print(f"{RED}錯誤: 無法解析遠端倉庫名稱與擁有人 (URL: {git_info['remote_url']}){RESET}")
+        return
+        
+    provider = config["active_provider"]
+    token = config["github_token"] if provider == "github" else config["gitlab_token"]
+    if not token:
+        print(f"{RED}錯誤: 您尚未登入 {provider.upper()}，無法調用 API 新增協作者。{RESET}")
+        return
+
+    if provider == "github":
+        username = input("請輸入要加入的 GitHub 帳號: ").strip()
+        if not username:
+            print("取消操作。")
+            return
+            
+        print(f"正在將 {username} 新增至 {owner}/{repo} 協作者清單...")
+        
+        url = f"https://api.github.com/repos/{owner}/{repo}/collaborators/{username}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "gtui-app"
+        }
+        data = {"permission": "push"}
+        res, status = api_request(url, method="PUT", headers=headers, data=data)
+        
+        if status in [201, 204]:
+            if status == 201:
+                print(f"\n{GREEN}✔ 成功邀請協作者 {username}！邀請函已發送。{RESET}")
+                invite_url = res.get("html_url")
+                if invite_url:
+                    print(f"邀請接受網址: {CYAN}{invite_url}{RESET}")
+            else:
+                print(f"\n{GREEN}✔ 使用者 {username} 已經是此倉庫的協作者。{RESET}")
+        else:
+            print(f"\n{RED}❌ 新增協作者失敗: {res.get('message')}{RESET}")
+            
+    elif provider == "gitlab":
+        username = input("請輸入要加入的 GitLab 帳號: ").strip()
+        if not username:
+            print("取消操作。")
+            return
+            
+        host = config["gitlab_host"].rstrip('/')
+        print(f"正在查詢 GitLab 使用者 {username} 的 ID...")
+        
+        user_url = f"{host}/api/v4/users?username={username}"
+        headers = {
+            "Private-Token": token
+        }
+        user_res, user_status = api_request(user_url, method="GET", headers=headers)
+        
+        if user_status != 200 or not isinstance(user_res, list) or len(user_res) == 0:
+            print(f"\n{RED}❌ 找不到 GitLab 使用者 {username}。{RESET}")
+            return
+            
+        user_id = user_res[0].get("id")
+        print(f"使用者 ID: {user_id}，正在新增至專案成員清單...")
+        
+        encoded_project = urllib.parse.quote_plus(f"{owner}/{repo}")
+        url = f"{host}/api/v4/projects/{encoded_project}/members"
+        
+        data = {
+            "user_id": user_id,
+            "access_level": 30
+        }
+        res, status = api_request(url, method="POST", headers=headers, data=data)
+        if status == 201:
+            print(f"\n{GREEN}✔ 成功將 {username} 新增為專案成員 (Developer 權限)！{RESET}")
+        else:
+            print(f"\n{RED}❌ 新增專案成員失敗: {res.get('message')}{RESET}")
+
+def branch_management_flow():
+    print(f"{BOLD}{BLUE}=== 🌿 分支管理 ==={RESET}")
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫。{RESET}")
+        return
+
+    # Get branches
+    res = subprocess.run(["git", "branch", "--format=%(refname:short)"], capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"{RED}無法獲取分支資訊。{RESET}")
+        return
+        
+    branches = [b.strip() for b in res.stdout.splitlines() if b.strip()]
+    if not branches:
+        print(f"{YELLOW}目前沒有任何分支。{RESET}")
+        return
+        
+    current_res = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True)
+    current_branch = current_res.stdout.strip()
+    if not current_branch:
+        res_ref = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+        current_branch = res_ref.stdout.strip()
+    
+    branch_options = []
+    for b in branches:
+        suffix = " (目前分支)" if b == current_branch else ""
+        branch_options.append({"name": f"🌿 {b}{suffix}", "branch_name": b})
+    branch_options.append({"name": "🆕 建立新分支 (Create New Branch)", "branch_name": "__create__"})
+    branch_options.append({"name": "⬅️ 返回主選單", "branch_name": "__back__"})
+    
+    fd = sys.stdin.fileno()
+    selected_idx = 0
+    
+    while True:
+        print_header(load_config(), git_info)
+        print(f"  {BOLD}{YELLOW}::: 🌿 本地分支清單 ::: {RESET}\n")
+        for idx, opt in enumerate(branch_options):
+            if idx == selected_idx:
+                print(f"  {CYAN}▶  {BOLD}{UNDERLINE}{opt['name']}{RESET}")
+            else:
+                print(f"     {GRAY}{opt['name']}{RESET}")
+        print("\n" + f"  {GRAY}提示: [↑/↓] 移動，[Enter] 選擇，[q] 返回{RESET}")
+        
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                ch2 = sys.stdin.read(1)
+                if ch2 == '[':
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == 'A':    # Up
+                        selected_idx = (selected_idx - 1) % len(branch_options)
+                    elif ch3 == 'B':  # Down
+                        selected_idx = (selected_idx + 1) % len(branch_options)
+            elif ch.lower() == 'q':
+                return
+            elif ch in ['\r', '\n']:
+                break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            
+    chosen = branch_options[selected_idx]
+    branch_name = chosen["branch_name"]
+    
+    if branch_name == "__back__":
+        return
+        
+    if branch_name == "__create__":
+        print(CLEAR_SCREEN)
+        print(f"{BOLD}{BLUE}=== 🆕 建立新分支 ==={RESET}")
+        new_branch = input("請輸入新分支名稱: ").strip()
+        if not new_branch:
+            print("已取消。")
+            return
+        rc = run_command_live(["git", "checkout", "-b", new_branch])
+        if rc == 0:
+            print(f"{GREEN}✔ 成功建立並切換至新分支: {new_branch}{RESET}")
+        return
+        
+    # Branch actions menu
+    print(CLEAR_SCREEN)
+    print(f"{BOLD}{BLUE}=== 🌿 分支操作: {branch_name} ==={RESET}")
+    print(f"1. 切換至此分支 (git checkout {branch_name})")
+    print(f"2. 刪除此分支 (git branch -d {branch_name})")
+    print(f"3. 合併此分支到目前分支 (git merge {branch_name})")
+    print(f"4. 取消")
+    
+    act = input("請選擇操作 (1-4): ").strip()
+    if act == '1':
+        rc = run_command_live(["git", "checkout", branch_name])
+        if rc == 0:
+            print(f"{GREEN}✔ 成功切換至分支 {branch_name}{RESET}")
+    elif act == '2':
+        if branch_name == current_branch:
+            print(f"{RED}錯誤: 無法刪除目前所在的分支。請先切換至其他分支。{RESET}")
+            return
+        rc = run_command_live(["git", "branch", "-d", branch_name])
+        if rc != 0:
+            ans = input(f"{YELLOW}普通刪除失敗，是否強制刪除？ (y/N): {RESET}").strip().lower()
+            if ans == 'y':
+                run_command_live(["git", "branch", "-D", branch_name])
+    elif act == '3':
+        ans = input(f"確認要將 {branch_name} 合併到目前分支 {current_branch} 嗎？ (y/N): ").strip().lower()
+        if ans == 'y':
+            run_command_live(["git", "merge", branch_name])
+
+def commit_history_flow():
+    print(f"{BOLD}{BLUE}=== 📜 提交歷史 (Commit History) ==={RESET}")
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫。{RESET}")
+        return
+        
+    cmd = ["git", "log", "-n", "15", "--oneline", "--decorate", "--color"]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"{RED}無法取得提交歷史。{RESET}")
+        return
+        
+    output = res.stdout.strip()
+    if not output:
+        print(f"{YELLOW}目前此分支沒有任何提交紀錄。{RESET}")
+        return
+        
+    print(f"\n{BOLD}{YELLOW}::: 最近 15 次 Commit 紀錄 ::: {RESET}")
+    print(output)
+
+def view_issues_flow(config):
+    print(f"{BOLD}{BLUE}=== 📋 專案 Issue 追蹤 ==={RESET}")
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫。{RESET}")
+        return
+    if git_info["remote_url"] == "None":
+        print(f"{RED}錯誤: 尚未設定遠端倉庫，無法讀取 Issue。{RESET}")
+        return
+        
+    owner, repo = parse_git_remote(git_info["remote_url"])
+    if not owner or not repo:
+        print(f"{RED}錯誤: 無法解析遠端倉庫名稱與擁有人 (URL: {git_info['remote_url']}){RESET}")
+        return
+        
+    provider = config["active_provider"]
+    token = config["github_token"] if provider == "github" else config["gitlab_token"]
+    if not token:
+        print(f"{RED}錯誤: 您尚未登入 {provider.upper()}，無法調用 API 查看 Issue。{RESET}")
+        return
+
+    print("正在從雲端平台獲取 Open Issues 列表...")
+    if provider == "github":
+        url = f"https://api.github.com/repos/{owner}/{repo}/issues?state=open&per_page=15"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "gtui-app"
+        }
+        res, status = api_request(url, headers=headers)
+        if status != 200:
+            print(f"{RED}無法取得 Issue 列表: {res.get('message', '未知錯誤')}{RESET}")
+            return
+            
+        issues = [i for i in res if "pull_request" not in i]
+        
+        if not issues:
+            print(f"{GREEN}✔ 太棒了！此倉庫目前沒有任何 Open Issues。{RESET}")
+            return
+            
+        print(f"\n{BOLD}{YELLOW}::: {owner}/{repo} Open Issues (最近 15 筆) ::: {RESET}")
+        for i in issues:
+            num = i.get("number")
+            title = i.get("title")
+            user = i.get("user", {}).get("login", "unknown")
+            created_at = i.get("created_at", "")[:10]
+            print(f"  {CYAN}#{num}{RESET} - {BOLD}{title}{RESET} ({GRAY}由 {user} 於 {created_at} 建立{RESET})")
+            
+    elif provider == "gitlab":
+        host = config["gitlab_host"].rstrip('/')
+        encoded_project = urllib.parse.quote_plus(f"{owner}/{repo}")
+        url = f"{host}/api/v4/projects/{encoded_project}/issues?state=opened&per_page=15"
+        headers = {
+            "Private-Token": token
+        }
+        res, status = api_request(url, headers=headers)
+        if status != 200:
+            print(f"{RED}無法取得 Issue 列表: {res.get('message', '未知錯誤')}{RESET}")
+            return
+            
+        if not res:
+            print(f"{GREEN}✔ 太棒了！此倉庫目前沒有任何 Open Issues。{RESET}")
+            return
+            
+        print(f"\n{BOLD}{YELLOW}::: {owner}/{repo} Open Issues (最近 15 筆) ::: {RESET}")
+        for i in res:
+            num = i.get("iid")
+            title = i.get("title")
+            user = i.get("author", {}).get("username", "unknown")
+            created_at = i.get("created_at", "")[:10]
+            print(f"  {CYAN}#{num}{RESET} - {BOLD}{title}{RESET} ({GRAY}由 {user} 於 {created_at} 建立{RESET})")
+
+def view_collaborators_flow(config):
+    print(f"{BOLD}{BLUE}=== 👥 查看協作者清單 ==={RESET}")
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫。{RESET}")
+        return
+    if git_info["remote_url"] == "None":
+        print(f"{RED}錯誤: 尚未設定遠端倉庫，無法讀取協作者。{RESET}")
+        return
+        
+    owner, repo = parse_git_remote(git_info["remote_url"])
+    if not owner or not repo:
+        print(f"{RED}錯誤: 無法解析遠端倉庫名稱與擁有人 (URL: {git_info['remote_url']}){RESET}")
+        return
+        
+    provider = config["active_provider"]
+    token = config["github_token"] if provider == "github" else config["gitlab_token"]
+    if not token:
+        print(f"{RED}錯誤: 您尚未登入 {provider.upper()}，無法調用 API 查看協作者。{RESET}")
+        return
+
+    print("正在從雲端平台獲取協作者列表...")
+    if provider == "github":
+        url = f"https://api.github.com/repos/{owner}/{repo}/collaborators"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "gtui-app"
+        }
+        res, status = api_request(url, headers=headers)
+        if status != 200:
+            print(f"{RED}無法取得協作者列表: {res.get('message', '未知錯誤')}{RESET}")
+            return
+            
+        print(f"\n{BOLD}{YELLOW}::: {owner}/{repo} 協作者清單 ::: {RESET}")
+        for c in res:
+            login = c.get("login")
+            role_name = c.get("role_name", "collaborator")
+            print(f"  👤 {BOLD}{login}{RESET} ({CYAN}{role_name}{RESET})")
+            
+    elif provider == "gitlab":
+        host = config["gitlab_host"].rstrip('/')
+        encoded_project = urllib.parse.quote_plus(f"{owner}/{repo}")
+        url = f"{host}/api/v4/projects/{encoded_project}/members"
+        headers = {
+            "Private-Token": token
+        }
+        res, status = api_request(url, headers=headers)
+        if status != 200:
+            print(f"{RED}無法取得成員列表: {res.get('message', '未知錯誤')}{RESET}")
+            return
+            
+        print(f"\n{BOLD}{YELLOW}::: {owner}/{repo} 成員清單 ::: {RESET}")
+        levels = {10: "Guest", 20: "Reporter", 30: "Developer", 40: "Maintainer", 50: "Owner"}
+        for m in res:
+            username = m.get("username")
+            access_level = m.get("access_level")
+            role_name = levels.get(access_level, f"Level {access_level}")
+            print(f"  👤 {BOLD}{username}{RESET} ({CYAN}{role_name}{RESET})")
+
+def commit_graph_flow():
+    print(f"{BOLD}{BLUE}=== 🌿 分支樹狀圖 (Commit Graph) ==={RESET}")
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫。{RESET}")
+        return
+        
+    cmd = [
+        "git", "log", "--graph", "--all", "--color",
+        "--format=format:%C(bold blue)%h%C(reset) - %C(bold green)(%ar)%C(reset) %C(white)%s%C(reset) %C(bold yellow)%d%C(reset)"
+    ]
+    res = subprocess.run(cmd + ["-n", "30"], capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"{RED}無法取得分支圖。{RESET}")
+        return
+        
+    output = res.stdout
+    if not output.strip():
+        print(f"{YELLOW}目前倉庫無任何 commit。{RESET}")
+        return
+        
+    print(f"\n{BOLD}{YELLOW}::: 顯示最近 30 筆 Commit 樹狀圖 ::: {RESET}\n")
+    print(output)
+
+def interactive_staging_flow():
+    print(f"{BOLD}{BLUE}=== 🔍 暫存區與檔案差異管理 ==={RESET}")
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫。{RESET}")
+        return
+        
+    fd = sys.stdin.fileno()
+    
+    while True:
+        res = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"{RED}無法取得暫存狀態。{RESET}")
+            return
+            
+        lines = res.stdout.splitlines()
+        files = []
+        for line in lines:
+            if len(line) >= 4:
+                status_code = line[:2]
+                filepath = line[3:].strip('"')
+                files.append((filepath, status_code))
+                
+        if not files:
+            print(f"{GREEN}✔ 目前沒有任何未提交的檔案變更。{RESET}")
+            return
+            
+        cursor_idx = 0
+        while True:
+            term_height = shutil.get_terminal_size().lines
+            max_display = max(5, term_height - 8)
+            
+            print(CLEAR_SCREEN)
+            print(f"  {BOLD}{YELLOW}::: 🔍 檔案暫存與 Diff 管理 :::{RESET}")
+            print(f"  {GRAY}操作說明: [↑/↓] 移動，[Space] 暫存/取消暫存，[d] 查看該檔 Diff，[Enter/q] 返回{RESET}\n")
+            
+            start_idx = max(0, cursor_idx - max_display // 2)
+            end_idx = min(len(files), start_idx + max_display)
+            
+            for idx in range(start_idx, end_idx):
+                filepath, status_code = files[idx]
+                is_staged = status_code[0] in ['M', 'A', 'D', 'R', 'C']
+                
+                check = "[✓]" if is_staged else "[ ]"
+                
+                if status_code == '??':
+                    color = RED
+                    lbl = "新增未追蹤"
+                elif status_code[0] == 'A':
+                    color = GREEN
+                    lbl = "已暫存新增"
+                elif status_code[0] == 'M':
+                    color = GREEN
+                    lbl = "已暫存修改"
+                elif status_code[1] == 'M':
+                    color = YELLOW
+                    lbl = "未暫存修改"
+                elif status_code[0] == 'D':
+                    color = RED
+                    lbl = "已暫存刪除"
+                elif status_code[1] == 'D':
+                    color = RED
+                    lbl = "未暫存刪除"
+                else:
+                    color = CYAN
+                    lbl = "有變更"
+                    
+                line_str = f" {check} {color}{filepath:<30}{RESET} {GRAY}({lbl}){RESET}"
+                
+                if idx == cursor_idx:
+                    print(f"  {CYAN}▶ {BOLD}{UNDERLINE}{line_str}{RESET}")
+                else:
+                    print(f"    {line_str}")
+                    
+            if len(files) > max_display:
+                print(f"\n  {GRAY}-- 顯示 {start_idx+1}-{end_idx} 筆，共 {len(files)} 筆 --{RESET}")
+                
+            old_settings = termios.tcgetattr(fd)
+            action = None
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+                if ch == '\x1b':
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == '[':
+                        ch3 = sys.stdin.read(1)
+                        if ch3 == 'A':    # Up
+                            cursor_idx = (cursor_idx - 1) % len(files)
+                        elif ch3 == 'B':  # Down
+                            cursor_idx = (cursor_idx + 1) % len(files)
+                elif ch == ' ':
+                    action = "toggle"
+                elif ch.lower() == 'd':
+                    action = "diff"
+                elif ch in ['\r', '\n', 'q', 'Q']:
+                    action = "exit"
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                
+            if action == "exit":
+                return
+            elif action == "toggle":
+                filepath, status_code = files[cursor_idx]
+                is_staged = status_code[0] in ['M', 'A', 'D', 'R', 'C']
+                if is_staged:
+                    subprocess.run(["git", "restore", "--staged", filepath])
+                else:
+                    subprocess.run(["git", "add", filepath])
+                break
+            elif action == "diff":
+                filepath, status_code = files[cursor_idx]
+                print(CLEAR_SCREEN)
+                print(f"{BOLD}{BLUE}=== 🔍 變更差異: {filepath} ==={RESET}\n")
+                
+                is_staged = status_code[0] in ['M', 'A', 'D', 'R', 'C']
+                if status_code == '??':
+                    print(f"{YELLOW}此檔案為全新未追蹤檔案，尚無 Diff 比對紀錄。{RESET}")
+                else:
+                    diff_cmd = ["git", "diff", "--color"]
+                    if is_staged:
+                        diff_cmd.append("--cached")
+                    diff_cmd.append(filepath)
+                    diff_res = subprocess.run(diff_cmd, capture_output=True, text=True)
+                    print(diff_res.stdout)
+                    
+                input(f"\n{GRAY}請按 Enter 鍵返回列表...{RESET}")
+
+def stash_management_flow():
+    while True:
+        print(CLEAR_SCREEN)
+        print(f"{BOLD}{BLUE}=== 📦 Stash 暫存進度管理 ==={RESET}\n")
+        
+        res_list = subprocess.run(["git", "stash", "list"], capture_output=True, text=True)
+        stash_output = res_list.stdout.strip()
+        if stash_output:
+            print(f"{BOLD}{YELLOW}目前已有的 Stash 暫存紀錄：{RESET}")
+            print(f"{CYAN}{stash_output}{RESET}\n")
+        else:
+            print(f"{GRAY}(目前無任何暫存紀錄){RESET}\n")
+            
+        print("1. ➕ 新增工作區暫存 (Stash current changes)")
+        print("2. 🔄 恢復最近的暫存並移除紀錄 (Stash Pop)")
+        print("3. 📋 套用最近的暫存並保留紀錄 (Stash Apply)")
+        print("4. 🗑️ 刪除最近的暫存紀錄 (Stash Drop)")
+        print("5. 💥 清空所有暫存紀錄 (Stash Clear)")
+        print("6. ⬅️ 返回主選單")
+        
+        choice = input("\n請選擇操作 (1-6): ").strip()
+        if choice == '1':
+            msg = input("請輸入暫存備註訊息 (選填): ").strip()
+            cmd = ["git", "stash", "push"]
+            if msg:
+                cmd += ["-m", msg]
+            run_command_live(cmd)
+        elif choice == '2':
+            run_command_live(["git", "stash", "pop"])
+        elif choice == '3':
+            run_command_live(["git", "stash", "apply"])
+        elif choice == '4':
+            run_command_live(["git", "stash", "drop"])
+        elif choice == '5':
+            ans = input(f"{BOLD}{RED}⚠️ 警告：確定要刪除所有的 Stash 暫存記錄嗎？這無法復原！(y/N): {RESET}").strip().lower()
+            if ans == 'y':
+                run_command_live(["git", "stash", "clear"])
+        elif choice == '6' or not choice:
+            break
+            
+        input(f"\n{GRAY}請按 Enter 鍵繼續...{RESET}")
+
+def tag_management_flow(config):
+    while True:
+        print(CLEAR_SCREEN)
+        print(f"{BOLD}{BLUE}=== 🏷️ Tag 版本標籤管理 ==={RESET}\n")
+        
+        res_list = subprocess.run(["git", "tag", "-n1"], capture_output=True, text=True)
+        tag_output = res_list.stdout.strip()
+        if tag_output:
+            print(f"{BOLD}{YELLOW}目前的 Tag 標籤清單：{RESET}")
+            print(f"{CYAN}{tag_output}{RESET}\n")
+        else:
+            print(f"{GRAY}(目前尚無任何 Tag 標籤){RESET}\n")
+            
+        print("1. ➕ 建立新 Tag (Create Tag)")
+        print("2. 🗑️ 刪除本地 Tag (Delete Tag)")
+        print("3. 🚀 推送所有 Tag 到遠端倉庫 (Push Tags)")
+        print("4. ⬅️ 返回主選單")
+        
+        choice = input("\n請選擇操作 (1-4): ").strip()
+        if choice == '1':
+            tag_name = input("請輸入 Tag 名稱 (例如 v1.0.0): ").strip()
+            if not tag_name:
+                continue
+            msg = input("請輸入 Tag 備註訊息 (選填): ").strip()
+            cmd = ["git", "tag"]
+            if msg:
+                cmd += ["-a", tag_name, "-m", msg]
+            else:
+                cmd.append(tag_name)
+            rc = run_command_live(cmd)
+            if rc == 0:
+                print(f"{GREEN}✔ 成功建立 Tag: {tag_name}{RESET}")
+        elif choice == '2':
+            tag_name = input("請輸入要刪除的 Tag 名稱: ").strip()
+            if not tag_name:
+                continue
+            rc = run_command_live(["git", "tag", "-d", tag_name])
+            if rc == 0:
+                print(f"{GREEN}✔ 成功刪除 Tag: {tag_name}{RESET}")
+        elif choice == '3':
+            git_info = get_git_info()
+            if git_info["remote_url"] == "None":
+                print(f"{RED}錯誤：尚未綁定遠端倉庫，無法推送。{RESET}")
+            else:
+                run_push_with_fallback(config, ["git", "push", "origin", "--tags"])
+        elif choice == '4' or not choice:
+            break
+            
+        input(f"\n{GRAY}請按 Enter 鍵繼續...{RESET}")
+
 # --- Main Entry ---
 
 def main():
@@ -821,6 +1912,7 @@ def main():
         sys.exit(1)
         
     config = load_config()
+    ensure_gitignore()
     
     # Check if there is an active provider login on startup and set default if needed
     if config["github_token"]:
@@ -829,16 +1921,40 @@ def main():
         config["active_provider"] = "gitlab"
         
     menu_options = [
-        {"name": "🔑 一鍵登入 (GitHub / GitLab)", "func": lambda: login_flow(config)},
-        {"name": "📁 初始化 Git 倉庫 (git init)", "func": init_flow},
-        {"name": "🔗 變更遠端 Repo 網址", "func": change_remote_flow},
-        {"name": "🆕 在平台創立新 Repo", "func": lambda: create_repo_flow(config)},
-        {"name": "🚀 一鍵暫存、提交並 Push", "func": lambda: push_flow(config)},
-        {"name": "🗑️ 極簡刪除檔案", "func": delete_files_flow},
-        {"name": "⚡ 一鍵創 Repo 並將整資料夾 Push 上去", "func": lambda: quick_create_push_flow(config)},
-        {"name": "⚡ 一鍵指定 Repo 並將整資料夾 Push 上去", "func": lambda: quick_specify_push_flow(config)},
-        {"name": "🔀 建立 Pull Request (PR / MR)", "func": lambda: create_pr_flow(config)},
-        {"name": "❌ 結束退出", "func": None}
+        {"name": "帳號與授權", "is_header": True},
+        {"name": "🔑 平台登入與授權管理 (GitHub / GitLab)", "func": lambda: login_flow(config)},
+        
+        {"name": "本地倉庫管理", "is_header": True},
+        {"name": "📁 初始化本地 Git 倉庫 (git init)", "func": init_flow},
+        {"name": "📥 克隆/下載遠端倉庫 (git clone)", "func": lambda: clone_flow(config)},
+        {"name": "🗑️ 刪除專案內檔案 (安全移除/git rm)", "func": delete_files_flow},
+        
+        {"name": "日常提交與推送", "is_header": True},
+        {"name": "📤 一鍵暫存、提交並 Push 推送", "func": lambda: push_flow(config)},
+        {"name": "🔄 檢查更新並 Pull 推送 (適合已有變更的倉庫)", "func": lambda: quick_push_existing_flow(config)},
+        {"name": "🔍 暫存區與檔案差異管理 (Staging & Diff)", "func": interactive_staging_flow},
+        {"name": "📦 Stash 暫存進度管理 (Git Stash)", "func": stash_management_flow},
+        {"name": "🔗 變更/設定遠端倉庫網址 (git remote url)", "func": change_remote_flow},
+        
+        {"name": "專案與分支管理", "is_header": True},
+        {"name": "🌿 本地分支管理 (切換/建立/刪除/合併)", "func": branch_management_flow},
+        {"name": "🌿 圖形化分支樹狀圖 (Commit Graph)", "func": commit_graph_flow},
+        {"name": "🏷️ Tag 版本標籤管理 (Git Tags)", "func": lambda: tag_management_flow(config)},
+        {"name": "📜 查看最近提交歷史 (git log)", "func": commit_history_flow},
+        {"name": "📋 查看雲端 Open Issues (最近 15 筆)", "func": lambda: view_issues_flow(config)},
+        
+        {"name": "快速一鍵發布", "is_header": True},
+        {"name": "🆕 在雲端創建全新空白倉庫", "func": lambda: create_repo_flow(config)},
+        {"name": "⚡ 建立全新雲端倉庫並推送此目錄所有檔案", "func": lambda: quick_create_push_flow(config)},
+        {"name": "⚡ 指定現有雲端倉庫並推送此目錄所有檔案", "func": lambda: quick_specify_push_flow(config)},
+        
+        {"name": "團隊協作", "is_header": True},
+        {"name": "👥 新增倉庫協作者 (Add Collaborator)", "func": lambda: add_collaborator_flow(config)},
+        {"name": "👥 查看專案協作者清單 (Collaborators)", "func": lambda: view_collaborators_flow(config)},
+        {"name": "🔀 建立 Pull Request / Merge Request (PR / MR)", "func": lambda: create_pr_flow(config)},
+        
+        {"name": "系統操作", "is_header": True},
+        {"name": "❌ 結束並退出程式", "func": None}
     ]
     
     try:
@@ -850,7 +1966,7 @@ def main():
                 
             # Run selected action in cooked mode
             print(CLEAR_SCREEN)
-            action_func = menu_options[sel]["func"]
+            action_func = menu_options[sel].get("func")
             if action_func:
                 try:
                     action_func()
