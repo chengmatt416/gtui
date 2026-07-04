@@ -13,6 +13,7 @@ import termios
 import tty
 import shutil
 import time
+import re
 from datetime import datetime
 
 # ANSI escape codes for beautiful formatting
@@ -263,6 +264,30 @@ def run_command_live(cmd):
         print(f"{RED}執行失敗: {e}{RESET}")
         return -1
 
+def run_command_live_capture(cmd):
+    print(f"{BOLD}{GRAY}執行指令: {' '.join(cmd)}{RESET}")
+    output_lines = []
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            output_lines.append(line)
+        process.wait()
+        return process.returncode, "".join(output_lines)
+    except Exception as e:
+        print(f"{RED}執行失敗: {e}{RESET}")
+        return -1, str(e)
+
 def parse_git_remote(url):
     url_str = url.strip()
     if url_str.endswith(".git"):
@@ -373,12 +398,30 @@ def get_or_create_ssh_key(username):
     ssh_dir = os.path.expanduser("~/.ssh")
     os.makedirs(ssh_dir, exist_ok=True)
     
-    possible_keys = ["id_ed25519.pub", "id_rsa.pub", "id_ecdsa.pub", "id_dsa.pub"]
-    for k in possible_keys:
-        path = os.path.join(ssh_dir, k)
-        if os.path.exists(path):
-            return path
-            
+    def ensure_pub_key(priv_key_path):
+        pub_key_path = priv_key_path + ".pub"
+        if not os.path.exists(pub_key_path):
+            try:
+                res = subprocess.run(
+                    ["ssh-keygen", "-y", "-f", priv_key_path],
+                    capture_output=True, text=True
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    with open(pub_key_path, 'w', encoding='utf-8') as f:
+                        f.write(res.stdout.strip())
+            except Exception:
+                pass
+        return pub_key_path
+        
+    possible_priv_keys = ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"]
+    for k in possible_priv_keys:
+        priv_path = os.path.join(ssh_dir, k)
+        if os.path.exists(priv_path):
+            pub_path = ensure_pub_key(priv_path)
+            if os.path.exists(pub_path):
+                subprocess.run(["ssh-add", priv_path], capture_output=True)
+                return pub_path
+                
     key_path = os.path.join(ssh_dir, "id_ed25519")
     pub_key_path = key_path + ".pub"
     print("正在生成新的 Ed25519 SSH 金鑰...")
@@ -390,6 +433,364 @@ def get_or_create_ssh_key(username):
         subprocess.run(["ssh-add", key_path], capture_output=True)
         return pub_key_path
     return None
+
+def ensure_ssh_auth_uploaded(config, domain, provider, username):
+    ssh_ok = False
+    print(f"正在檢查與 git@{domain} 的 SSH 連線...")
+    try:
+        res = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", "-T", f"git@{domain}"],
+            capture_output=True, text=True
+        )
+        output = res.stdout + res.stderr
+        if "successfully authenticated" in output or "Welcome to GitLab" in output or "Welcome to" in output:
+            ssh_ok = True
+            print(f"{GREEN}✔ SSH 連線成功。{RESET}")
+    except Exception as e:
+        print(f"{RED}檢查 SSH 連線時發生錯誤: {e}{RESET}")
+        
+    if not ssh_ok:
+        print(f"{YELLOW}未檢測到有效的 SSH 金鑰設定或 SSH 測試失敗。{RESET}")
+        ans_key = input("是否自動為您生成並在雲端設定 SSH 金鑰？ (Y/n): ").strip().lower()
+        if ans_key != 'n':
+            token = config.get(f"{provider}_token")
+            if not token:
+                print(f"{RED}您尚未登入此平台，無法自動上傳 SSH 金鑰。請先在主選單執行登入。{RESET}")
+                return False
+                
+            pub_key_path = get_or_create_ssh_key(username)
+            if pub_key_path:
+                try:
+                    with open(pub_key_path, 'r', encoding='utf-8') as f:
+                        pub_key_content = f.read().strip()
+                        
+                    print(f"正在上傳 SSH 金鑰至您的 {provider.upper()} 帳戶...")
+                    title = f"GTUI SSH Key ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+                    
+                    if provider == "github":
+                        url = "https://api.github.com/user/keys"
+                        headers = {
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/vnd.github+json",
+                            "User-Agent": "gtui-app"
+                        }
+                        data = {"title": title, "key": pub_key_content}
+                        res, status = api_request(url, method="POST", headers=headers, data=data)
+                        if status == 201:
+                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitHub！{RESET}")
+                            ssh_ok = True
+                        elif status == 422:
+                            is_already_in_use = False
+                            errors = res.get("errors", [])
+                            if isinstance(errors, list):
+                                for err in errors:
+                                    if isinstance(err, dict) and "already in use" in err.get("message", ""):
+                                        is_already_in_use = True
+                                        break
+                            if is_already_in_use:
+                                print(f"{GREEN}✔ 偵測到 SSH 金鑰已存在於 GitHub 帳戶中，將繼續使用該金鑰。{RESET}")
+                                ssh_ok = True
+                            else:
+                                print(f"{RED}❌ 無法上傳金鑰至 GitHub: {res.get('message')}{RESET}")
+                        else:
+                            print(f"{RED}❌ 無法上傳金鑰至 GitHub: {res.get('message')}{RESET}")
+                    elif provider == "gitlab":
+                        host = config.get("gitlab_host", "https://gitlab.com").rstrip('/')
+                        url = f"{host}/api/v4/user/keys"
+                        headers = {"Private-Token": token}
+                        data = {"title": title, "key": pub_key_content}
+                        res, status = api_request(url, method="POST", headers=headers, data=data)
+                        if status == 201:
+                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitLab！{RESET}")
+                            ssh_ok = True
+                        elif status == 400:
+                            is_already_in_use = False
+                            msg = res.get("message", {})
+                            if isinstance(msg, dict):
+                                for key_errs in msg.values():
+                                    if isinstance(key_errs, list):
+                                        for err in key_errs:
+                                            if "already been taken" in str(err):
+                                                is_already_in_use = True
+                                                break
+                            elif "already been taken" in str(msg):
+                                is_already_in_use = True
+                                
+                            if is_already_in_use:
+                                print(f"{GREEN}✔ 偵測到 SSH 金鑰已存在於 GitLab 帳戶中，將繼續使用該金鑰。{RESET}")
+                                ssh_ok = True
+                            else:
+                                print(f"{RED}❌ 無法上傳金鑰至 GitLab: {res.get('message')}{RESET}")
+                        else:
+                            print(f"{RED}❌ 無法上傳金鑰至 GitLab: {res.get('message')}{RESET}")
+                except Exception as e:
+                    print(f"{RED}上傳金鑰時出錯: {e}{RESET}")
+            else:
+                return False
+                
+    return ssh_ok
+
+def setup_lfs_for_files(files_with_sizes):
+    if not shutil.which("git-lfs"):
+        print(f"{RED}錯誤: 系統未安裝 git-lfs CLI。{RESET}")
+        print("請先在您的系統安裝 git-lfs。")
+        print("  - macOS: brew install git-lfs")
+        print("  - Debian/Ubuntu: sudo apt install git-lfs")
+        print("安裝後，請在終端執行 'git lfs install' 初始化。")
+        return False
+        
+    print(f"正在初始化 Git LFS...")
+    subprocess.run(["git", "lfs", "install"], capture_output=True)
+    
+    for filepath, size in files_with_sizes:
+        print(f"正在將 {filepath} 加入 Git LFS 追蹤...")
+        res_status = subprocess.run(["git", "status", "--porcelain", filepath], capture_output=True, text=True)
+        if res_status.stdout.strip():
+            subprocess.run(["git", "rm", "--cached", filepath], capture_output=True)
+            
+        subprocess.run(["git", "lfs", "track", filepath], capture_output=True)
+        subprocess.run(["git", "add", filepath], capture_output=True)
+        
+    subprocess.run(["git", "add", ".gitattributes"], capture_output=True)
+    print(f"{GREEN}✔ 成功使用 Git LFS 追蹤上述大檔案！{RESET}")
+    return True
+
+def ignore_files(files_with_sizes):
+    gitignore_path = ".gitignore"
+    to_add = []
+    for filepath, size in files_with_sizes:
+        to_add.append(filepath)
+        res_status = subprocess.run(["git", "status", "--porcelain", filepath], capture_output=True, text=True)
+        if res_status.stdout.strip():
+            subprocess.run(["git", "rm", "--cached", filepath], capture_output=True)
+            
+    if to_add:
+        try:
+            needs_leading_newline = False
+            if os.path.exists(gitignore_path) and os.path.getsize(gitignore_path) > 0:
+                with open(gitignore_path, 'rb') as f_bin:
+                    try:
+                        f_bin.seek(-1, 2)
+                        last_char = f_bin.read(1)
+                        if last_char != b'\n':
+                            needs_leading_newline = True
+                    except Exception:
+                        pass
+                        
+            with open(gitignore_path, 'a', encoding='utf-8') as f:
+                if needs_leading_newline:
+                    f.write('\n')
+                f.write("# Ignored large files added automatically by GTUI\n")
+                for filepath in to_add:
+                    f.write(f"{filepath}\n")
+            print(f"{GREEN}✔ 已自動將大檔案加入 .gitignore 並取消暫存。{RESET}")
+        except Exception as e:
+            print(f"{RED}無法更新 .gitignore: {e}{RESET}")
+
+def check_tracked_ignored_files():
+    res = subprocess.run(
+        ["git", "ls-files", "-i", "-c", "--exclude-standard"],
+        capture_output=True, text=True
+    )
+    if res.returncode != 0:
+        return
+        
+    ignored_tracked = res.stdout.splitlines()
+    if ignored_tracked:
+        print(f"\n{YELLOW}⚠️ 偵測到以下檔案已被 Git 追蹤，但符合 .gitignore 忽略規則：{RESET}")
+        for f in ignored_tracked:
+            print(f"  - {f}")
+        print(f"\n{GRAY}說明：這通常是因為檔案在加入 .gitignore 之前就已經被 commit 或 add。{RESET}")
+        ans = input("是否要從 Git 追蹤中移除它們（保留本地檔案，僅不再追蹤）？ (Y/n): ").strip().lower()
+        if ans != 'n':
+            for f in ignored_tracked:
+                subprocess.run(["git", "rm", "--cached", f], capture_output=True)
+            print(f"{GREEN}✔ 已成功將檔案從 Git 追蹤中移除。請提交此變更以套用。{RESET}")
+
+def auto_detect_gitignore_lfs(config):
+    git_info = get_git_info()
+    if not git_info["is_repo"]:
+        return
+        
+    check_tracked_ignored_files()
+    
+    res = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "--cached"],
+        capture_output=True, text=True
+    )
+    if res.returncode != 0:
+        return
+        
+    all_files = res.stdout.splitlines()
+    
+    lfs_tracked = set()
+    if shutil.which("git-lfs"):
+        res_lfs = subprocess.run(["git", "lfs", "ls-files"], capture_output=True, text=True)
+        if res_lfs.returncode == 0:
+            for line in res_lfs.stdout.splitlines():
+                parts = line.split(" - ", 1)
+                if len(parts) == 2:
+                    lfs_tracked.add(parts[1].strip())
+                    
+    large_files = []
+    for f in all_files:
+        if os.path.exists(f) and not os.path.isdir(f):
+            if f.startswith(".git/") or f == ".gitattributes" or f == ".gitignore":
+                continue
+            try:
+                size = os.path.getsize(f)
+                if size > 50 * 1024 * 1024:
+                    if f not in lfs_tracked:
+                        large_files.append((f, size))
+            except Exception:
+                pass
+                
+    if large_files:
+        print(f"\n{YELLOW}⚠️ 偵測到未被 LFS 追蹤的大檔案 (> 50MB):{RESET}")
+        for f, size in large_files:
+            print(f"  - {f} ({size / (1024*1024):.1f} MB)")
+            
+        print(f"\n{BOLD}建議的處理方式:{RESET}")
+        print(f"  1. {GREEN}自動啟用 Git LFS 追蹤這些檔案 (推薦，適合大檔案與二進位檔案){RESET}")
+        print(f"  2. {RED}自動將這些檔案加入 .gitignore 中以忽略提交{RESET}")
+        print(f"  3. {GRAY}暫不處理，繼續一般 Git 提交 (不推薦，可能導致 Push 失敗){RESET}")
+        
+        choice = input("請選擇處理方式 (1/2/3, 預設 1): ").strip()
+        if not choice:
+            choice = '1'
+            
+        if choice == '1':
+            setup_lfs_for_files(large_files)
+        elif choice == '2':
+            ignore_files(large_files)
+
+def manage_gitignore_lfs_flow(config):
+    while True:
+        print(CLEAR_SCREEN)
+        print(f"{BOLD}{BLUE}=== 🚫 .gitignore 與 Git LFS 追蹤管理 ==={RESET}")
+        
+        git_info = get_git_info()
+        if not git_info["is_repo"]:
+            print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫，請先初始化。{RESET}")
+            return
+            
+        print("請選擇操作項目:")
+        print("  1. 🔍 掃描專案內大檔案與忽略狀態 (自動診斷)")
+        print("  2. 📝 手動新增檔案或資料夾至 .gitignore")
+        print("  3. 📦 手動新增副檔名或路徑至 Git LFS 追蹤")
+        print("  4. 🗑️ 掃描並移除已在 .gitignore 中但仍在 Git 追蹤的檔案 (Fix Tracked Ignored)")
+        print("  5. 🔙 返回主選單")
+        
+        choice = input("\n請輸入選擇 (1-5): ").strip()
+        if choice == '1':
+            print(CLEAR_SCREEN)
+            res = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard", "--cached"],
+                capture_output=True, text=True
+            )
+            if res.returncode == 0:
+                all_files = res.stdout.splitlines()
+                
+                lfs_tracked = set()
+                if shutil.which("git-lfs"):
+                    res_lfs = subprocess.run(["git", "lfs", "ls-files"], capture_output=True, text=True)
+                    if res_lfs.returncode == 0:
+                        for line in res_lfs.stdout.splitlines():
+                            parts = line.split(" - ", 1)
+                            if len(parts) == 2:
+                                lfs_tracked.add(parts[1].strip())
+                                
+                large_files = []
+                for f in all_files:
+                    if os.path.exists(f) and not os.path.isdir(f):
+                        if f.startswith(".git/") or f == ".gitattributes" or f == ".gitignore":
+                            continue
+                        try:
+                            size = os.path.getsize(f)
+                            if size > 10 * 1024 * 1024:
+                                large_files.append((f, size, f in lfs_tracked))
+                        except Exception:
+                            pass
+            
+                if large_files:
+                    print(f"{BOLD}{YELLOW}::: 專案內的大檔案清單 ::: {RESET}\n")
+                    for f, size, is_lfs in large_files:
+                        status_str = f"{GREEN}已使用 Git LFS 追蹤{RESET}" if is_lfs else f"{RED}未使用 Git LFS 追蹤 (一般 Git 追蹤){RESET}"
+                        print(f" 📂 {f:<40} {size / (1024*1024):.1f} MB | 狀態: {status_str}")
+                    
+                    untracked_large = [(f, size) for f, size, is_lfs in large_files if not is_lfs]
+                    if untracked_large:
+                        print(f"\n{YELLOW}發現 {len(untracked_large)} 個大檔案未使用 Git LFS。{RESET}")
+                        ans = input("是否要將這些檔案轉換為 Git LFS 追蹤？ (Y/n): ").strip().lower()
+                        if ans != 'n':
+                            setup_lfs_for_files(untracked_large)
+                else:
+                    print(f"{GREEN}✔ 專案內未發現大於 10MB 的大檔案。{RESET}")
+            else:
+                print(f"{RED}無法獲取專案檔案清單。{RESET}")
+            input(f"\n{GRAY}請按 Enter 鍵繼續...{RESET}")
+            
+        elif choice == '2':
+            print(CLEAR_SCREEN)
+            print(f"{BOLD}::: 手動新增至 .gitignore ::: {RESET}\n")
+            path_to_ignore = input("請輸入要忽略的檔案、資料夾或 Pattern (例如 *.log, temp/): ").strip()
+            if path_to_ignore:
+                gitignore_path = ".gitignore"
+                try:
+                    needs_leading_newline = False
+                    if os.path.exists(gitignore_path) and os.path.getsize(gitignore_path) > 0:
+                        with open(gitignore_path, 'rb') as f_bin:
+                            try:
+                                f_bin.seek(-1, 2)
+                                last_char = f_bin.read(1)
+                                if last_char != b'\n':
+                                    needs_leading_newline = True
+                            except Exception:
+                                pass
+                                
+                    with open(gitignore_path, 'a', encoding='utf-8') as f:
+                        if needs_leading_newline:
+                            f.write('\n')
+                        f.write(f"{path_to_ignore}\n")
+                    print(f"{GREEN}✔ 已將 '{path_to_ignore}' 寫入 .gitignore。{RESET}")
+                    
+                    res_status = subprocess.run(["git", "rm", "-r", "--cached", path_to_ignore], capture_output=True, text=True)
+                    if res_status.returncode == 0:
+                        print(f"{GREEN}✔ 已取消暫存符合該條件的檔案。{RESET}")
+                except Exception as e:
+                    print(f"{RED}無法寫入 .gitignore: {e}{RESET}")
+            else:
+                print("未輸入任何路徑。")
+            input(f"\n{GRAY}請按 Enter 鍵繼續...{RESET}")
+            
+        elif choice == '3':
+            print(CLEAR_SCREEN)
+            print(f"{BOLD}::: 手動新增至 Git LFS 追蹤 ::: {RESET}\n")
+            if not shutil.which("git-lfs"):
+                print(f"{RED}錯誤: 系統未安裝 git-lfs CLI。請先安裝。{RESET}")
+            else:
+                pattern = input("請輸入要使用 LFS 追蹤的副檔名或路徑 (例如 *.mp4, assets/big.zip): ").strip()
+                if pattern:
+                    subprocess.run(["git", "lfs", "install"], capture_output=True)
+                    res_track = subprocess.run(["git", "lfs", "track", pattern], capture_output=True, text=True)
+                    if res_track.returncode == 0:
+                        subprocess.run(["git", "add", ".gitattributes"], capture_output=True)
+                        print(f"{GREEN}✔ 已成功設定 Git LFS 追蹤 '{pattern}'。{RESET}")
+                        print(f"{GRAY}請記得在提交時一併提交 .gitattributes 檔案。{RESET}")
+                    else:
+                        print(f"{RED}Git LFS 設定失敗: {res_track.stderr}{RESET}")
+                else:
+                    print("未輸入任何樣式。")
+            input(f"\n{GRAY}請按 Enter 鍵繼續...{RESET}")
+            
+        elif choice == '4':
+            print(CLEAR_SCREEN)
+            print(f"{BOLD}::: 修復已在 .gitignore 但被 Git 追蹤的檔案 ::: {RESET}\n")
+            check_tracked_ignored_files()
+            input(f"\n{GRAY}請按 Enter 鍵繼續...{RESET}")
+            
+        elif choice == '5':
+            break
 
 def check_and_handle_remote_updates(config):
     print("正在檢查遠端是否有新 Commit...")
@@ -466,37 +867,69 @@ def check_and_handle_remote_updates(config):
         return False
 
 def run_push_with_fallback(config, cmd):
-    rc = run_command_live(cmd)
+    rc, output = run_command_live_capture(cmd)
     if rc == 0:
         return 0
         
+    # Check if push failed because of large files
+    if "exceeds" in output and "file size limit" in output:
+        match = re.search(r"File\s+([^\s]+)\s+is\s+[\d\.]+\s+MB;\s+this\s+exceeds", output)
+        detected_file = match.group(1) if match else None
+        
+        print(f"\n{RED}❌ 檢測到 Push 失敗，因為檔案大小超過了 Git 雲端平台限制。{RESET}")
+        if detected_file:
+            print(f"超限檔案: {YELLOW}{detected_file}{RESET}")
+        print(f"{YELLOW}說明：該大檔案已存在於您的本地 Commit 歷史紀錄中。僅使用 'git lfs track' 無法解決已提交的歷史檔案。{RESET}")
+        print("您可以使用 'git lfs migrate' 來重寫本地 Commit 歷史，將該大檔案轉換為 Git LFS 追蹤。")
+        
+        ans_migrate = input("是否要自動執行 git lfs migrate 轉換歷史檔案？ (Y/n): ").strip().lower()
+        if ans_migrate != 'n':
+            if not shutil.which("git-lfs"):
+                print(f"{RED}錯誤: 系統未安裝 git-lfs CLI。請先安裝。{RESET}")
+                return rc
+                
+            target_file = detected_file
+            if not target_file:
+                target_file = input("無法自動解析超限檔案路徑，請手動輸入要轉換的檔案路徑 (例如: big_file.zip): ").strip()
+                
+            if target_file:
+                print(f"正在執行: git lfs migrate import --include=\"{target_file}\"")
+                res_mig = subprocess.run(["git", "lfs", "migrate", "import", f"--include={target_file}"], capture_output=True, text=True)
+                if res_mig.returncode == 0:
+                    print(f"{GREEN}✔ 歷史檔案轉換成功！已將 {target_file} 轉為 Git LFS。{RESET}")
+                    print("正在重新嘗試推送...")
+                    rc_retry, _ = run_command_live_capture(cmd)
+                    if rc_retry == 0:
+                        print(f"{GREEN}✔ 重新推送成功！{RESET}")
+                        return 0
+                else:
+                    print(f"{RED}歷史轉換失敗: {res_mig.stderr}{RESET}")
+                    
     git_info = get_git_info()
     remote_url = git_info["remote_url"]
     
     if remote_url == "None" or not (remote_url.startswith("http://") or remote_url.startswith("https://")):
         return rc
         
-    print(f"\n{YELLOW}⚠️ 檢測到 HTTPS 傳輸失敗，是否要切換至 SSH 傳輸大檔案？{RESET}")
+    print(f"\n{YELLOW}⚠️ 檢測到 HTTPS 傳輸失敗，是否要切換至 SSH 傳輸？{RESET}")
     ans = input("是否切換至 SSH 傳輸？ (Y/n): ").strip().lower()
     if ans == 'n':
         return rc
         
-    # Determine provider from the remote URL domain
     parsed_url = urllib.parse.urlparse(remote_url)
     domain = parsed_url.netloc
     if "@" in domain:
         domain = domain.split("@")[-1]
     if ":" in domain:
         domain = domain.split(":")[0]
-
+        
     if "gitlab" in domain.lower():
         provider = "gitlab"
     elif "github" in domain.lower():
         provider = "github"
     else:
         provider = config.get("active_provider", "github")
-    
-    # 1. Ask for username
+        
     username = config.get(f"{provider}_user")
     if not username:
         username = input(f"請輸入您的 {provider.upper()} 使用者名稱 (username): ").strip()
@@ -508,77 +941,16 @@ def run_push_with_fallback(config, cmd):
         print(f"{RED}錯誤: 未提供使用者名稱，無法繼續。{RESET}")
         return rc
         
-    # 2. Check SSH key status
-    ssh_ok = False
-    print(f"正在檢查與 git@{domain} 的 SSH 連線...")
-    try:
-        res = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", "-T", f"git@{domain}"],
-            capture_output=True, text=True
-        )
-        output = res.stdout + res.stderr
-        if "successfully authenticated" in output or "Welcome to GitLab" in output or "Welcome to" in output:
-            ssh_ok = True
-            print(f"{GREEN}✔ SSH 連線成功。{RESET}")
-    except Exception as e:
-        print(f"{RED}檢查 SSH 連線時發生錯誤: {e}{RESET}")
-        
+    ssh_ok = ensure_ssh_auth_uploaded(config, domain, provider, username)
     if not ssh_ok:
-        print(f"{YELLOW}未檢測到有效的 SSH 金鑰設定或 SSH 測試失敗。{RESET}")
-        ans_key = input("是否自動為您生成並在雲端設定 SSH 金鑰？ (Y/n): ").strip().lower()
-        if ans_key != 'n':
-            token = config.get(f"{provider}_token")
-            if not token:
-                print(f"{RED}您尚未登入此平台，無法自動上傳 SSH 金鑰。請先在主選單執行登入。{RESET}")
-                return rc
-                
-            pub_key_path = get_or_create_ssh_key(username)
-            if pub_key_path:
-                try:
-                    with open(pub_key_path, 'r', encoding='utf-8') as f:
-                        pub_key_content = f.read().strip()
-                        
-                    print(f"正在上傳 SSH 金鑰至您的 {provider.upper()} 帳戶...")
-                    title = f"GTUI SSH Key ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
-                    
-                    if provider == "github":
-                        url = "https://api.github.com/user/keys"
-                        headers = {
-                            "Authorization": f"Bearer {token}",
-                            "Accept": "application/vnd.github+json",
-                            "User-Agent": "gtui-app"
-                        }
-                        data = {"title": title, "key": pub_key_content}
-                        res, status = api_request(url, method="POST", headers=headers, data=data)
-                        if status == 201:
-                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitHub！{RESET}")
-                            ssh_ok = True
-                        else:
-                            print(f"{RED}❌ 無法上傳金鑰至 GitHub: {res.get('message')}{RESET}")
-                    elif provider == "gitlab":
-                        host = config.get("gitlab_host", "https://gitlab.com").rstrip('/')
-                        url = f"{host}/api/v4/user/keys"
-                        headers = {"Private-Token": token}
-                        data = {"title": title, "key": pub_key_content}
-                        res, status = api_request(url, method="POST", headers=headers, data=data)
-                        if status == 201:
-                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitLab！{RESET}")
-                            ssh_ok = True
-                        else:
-                            print(f"{RED}❌ 無法上傳金鑰至 GitLab: {res.get('message')}{RESET}")
-                except Exception as e:
-                    print(f"{RED}上傳金鑰時出錯: {e}{RESET}")
-            else:
-                return rc
-                
-    # 3. Convert remote URL to SSH
+        return rc
+        
     ssh_url = https_to_ssh_url(remote_url)
     print(f"正在將遠端倉庫網址變更為 SSH: {CYAN}{ssh_url}{RESET}")
     subprocess.run(["git", "remote", "set-url", "origin", ssh_url])
     
-    # 4. Retry push
     print("正在使用 SSH 重新嘗試推送...")
-    rc_retry = run_command_live(cmd)
+    rc_retry, _ = run_command_live_capture(cmd)
     if rc_retry == 0:
         print(f"{GREEN}✔ 使用 SSH 重新推送成功！{RESET}")
         return 0
@@ -638,66 +1010,10 @@ def clone_flow(config):
         print(f"{RED}錯誤: 未提供使用者名稱，無法繼續。{RESET}")
         return
         
-    # 2. Check SSH key status
-    ssh_ok = False
-    print(f"正在檢查與 git@{domain} 的 SSH 連線...")
-    try:
-        res = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", "-T", f"git@{domain}"],
-            capture_output=True, text=True
-        )
-        output = res.stdout + res.stderr
-        if "successfully authenticated" in output or "Welcome to GitLab" in output or "Welcome to" in output:
-            ssh_ok = True
-            print(f"{GREEN}✔ SSH 連線成功。{RESET}")
-    except Exception as e:
-        print(f"{RED}檢查 SSH 連線時發生錯誤: {e}{RESET}")
-        
-    if not ssh_ok:
-        print(f"{YELLOW}未檢測到有效的 SSH 金鑰設定或 SSH 測試失敗。{RESET}")
-        ans_key = input("是否自動為您生成並在雲端設定 SSH 金鑰？ (Y/n): ").strip().lower()
-        if ans_key != 'n':
-            token = config.get(f"{provider}_token")
-            if not token:
-                print(f"{RED}您尚未登入此平台，無法自動上傳 SSH 金鑰。請先在主選單執行登入。{RESET}")
-                return
-                
-            pub_key_path = get_or_create_ssh_key(username)
-            if pub_key_path:
-                try:
-                    with open(pub_key_path, 'r', encoding='utf-8') as f:
-                        pub_key_content = f.read().strip()
-                        
-                    print(f"正在上傳 SSH 金鑰至您的 {provider.upper()} 帳戶...")
-                    title = f"GTUI SSH Key ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
-                    
-                    if provider == "github":
-                        headers = {
-                            "Authorization": f"Bearer {token}",
-                            "Accept": "application/vnd.github+json",
-                            "User-Agent": "gtui-app"
-                        }
-                        data = {"title": title, "key": pub_key_content}
-                        res, status = api_request("https://api.github.com/user/keys", method="POST", headers=headers, data=data)
-                        if status == 201:
-                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitHub！{RESET}")
-                            ssh_ok = True
-                        else:
-                            print(f"{RED}❌ 無法上傳金鑰至 GitHub: {res.get('message')}{RESET}")
-                    elif provider == "gitlab":
-                        host = config.get("gitlab_host", "https://gitlab.com").rstrip('/')
-                        headers = {"Private-Token": token}
-                        data = {"title": title, "key": pub_key_content}
-                        res, status = api_request(f"{host}/api/v4/user/keys", method="POST", headers=headers, data=data)
-                        if status == 201:
-                            print(f"{GREEN}✔ 成功將 SSH 金鑰新增至 GitLab！{RESET}")
-                            ssh_ok = True
-                        else:
-                            print(f"{RED}❌ 無法上傳金鑰至 GitLab: {res.get('message')}{RESET}")
-                except Exception as e:
-                    print(f"{RED}上傳金鑰時出錯: {e}{RESET}")
-            else:
-                return
+        # 2. Check SSH key status
+        ssh_ok = ensure_ssh_auth_uploaded(config, domain, provider, username)
+        if not ssh_ok:
+            return
                 
     if ssh_ok:
         # Convert url to SSH
@@ -718,6 +1034,7 @@ def quick_push_existing_flow(config):
         print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫，請先初始化。{RESET}")
         return
         
+    auto_detect_gitignore_lfs(config)
     ensure_gitignore()
     git_info = get_git_info()
         
@@ -956,6 +1273,7 @@ def push_flow(config):
         print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫，請先初始化。{RESET}")
         return
         
+    auto_detect_gitignore_lfs(config)
     ensure_gitignore()
     # Re-evaluate git info since .gitignore might have been added/modified
     git_info = get_git_info()
@@ -1161,6 +1479,7 @@ def quick_create_push_flow(config):
         print("初始化本地 Git 倉庫...")
         subprocess.run(["git", "init"], capture_output=True)
         
+    auto_detect_gitignore_lfs(config)
     ensure_gitignore()
     
     # Set default branch
@@ -1199,6 +1518,7 @@ def quick_specify_push_flow(config):
         print("初始化本地 Git 倉庫...")
         subprocess.run(["git", "init"], capture_output=True)
         
+    auto_detect_gitignore_lfs(config)
     ensure_gitignore()
         
     # Set default branch
@@ -1685,12 +2005,15 @@ def commit_graph_flow():
     print(f"\n{BOLD}{YELLOW}::: 顯示最近 30 筆 Commit 樹狀圖 ::: {RESET}\n")
     print(output)
 
-def interactive_staging_flow():
+def interactive_staging_flow(config=None):
     print(f"{BOLD}{BLUE}=== 🔍 暫存區與檔案差異管理 ==={RESET}")
     git_info = get_git_info()
     if not git_info["is_repo"]:
         print(f"{RED}錯誤: 目前資料夾不是 Git 倉庫。{RESET}")
         return
+        
+    if config:
+        auto_detect_gitignore_lfs(config)
         
     fd = sys.stdin.fileno()
     
@@ -1932,7 +2255,8 @@ def main():
         {"name": "日常提交與推送", "is_header": True},
         {"name": "📤 一鍵暫存、提交並 Push 推送", "func": lambda: push_flow(config)},
         {"name": "🔄 檢查更新並 Pull 推送 (適合已有變更的倉庫)", "func": lambda: quick_push_existing_flow(config)},
-        {"name": "🔍 暫存區與檔案差異管理 (Staging & Diff)", "func": interactive_staging_flow},
+        {"name": "🔍 暫存區與檔案差異管理 (Staging & Diff)", "func": lambda: interactive_staging_flow(config)},
+        {"name": "🚫 偵測並管理 .gitignore 與 Git LFS 追蹤", "func": lambda: manage_gitignore_lfs_flow(config)},
         {"name": "📦 Stash 暫存進度管理 (Git Stash)", "func": stash_management_flow},
         {"name": "🔗 變更/設定遠端倉庫網址 (git remote url)", "func": change_remote_flow},
         
